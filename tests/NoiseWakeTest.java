@@ -11,8 +11,12 @@ public final class NoiseWakeTest {
         final List<String> commands = new CopyOnWriteArrayList<>();
         final List<String> subscriptions = new CopyOnWriteArrayList<>();
         final List<String> statuses = new CopyOnWriteArrayList<>();
+        final List<Boolean> switchStates = new CopyOnWriteArrayList<>();
+        final List<Map<String, Object>> updates = new CopyOnWriteArrayList<>();
+        final List<Map<String, Object>> saves = new CopyOnWriteArrayList<>();
         volatile boolean screensaver;
         volatile boolean screen = true;
+        volatile boolean oldRelease;
 
         public void executeCommand(String command, Map<String, Object> arguments, CommandCallback callback) {
             commands.add(command);
@@ -25,6 +29,16 @@ public final class NoiseWakeTest {
         public void showWindow(String title, String message, String button) {}
         public void hideWindow() {}
         public void log(String message) {}
+        public void publishSwitch(String key, String name, boolean state) {
+            assert "enabled".equals(key) && "Enabled".equals(name) : key + " " + name;
+            switchStates.add(state);
+        }
+        public void updateSettings(Map<String, Object> values) {
+            if (oldRelease) throw new UnsupportedOperationException("Setup controls are unavailable");
+            updates.add(new HashMap<>(values));
+        }
+        public void saveSettings(Map<String, Object> values) { saves.add(new HashMap<>(values)); }
+        Boolean lastSwitch() { return switchStates.isEmpty() ? null : switchStates.get(switchStates.size() - 1); }
 
         int count(String command) {
             int n = 0;
@@ -39,6 +53,7 @@ public final class NoiseWakeTest {
         static final AtomicInteger opened = new AtomicInteger();
         static final AtomicInteger closed = new AtomicInteger();
         static volatile boolean loud;
+        static volatile boolean explode;
         static volatile String failure;
         static volatile String lastSource;
 
@@ -50,6 +65,7 @@ public final class NoiseWakeTest {
         }
         public int read(short[] buffer) {
             try { Thread.sleep(5); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            if (explode) throw new IllegalStateException("boom");
             for (int i = 0; i < buffer.length; i++) buffer[i] = (short) (loud ? (i % 2 == 0 ? 32767 : -32767) : (i % 2 == 0 ? 30 : -30));
             return buffer.length;
         }
@@ -239,6 +255,71 @@ public final class NoiseWakeTest {
         Mic.failure = null;
     }
 
+    static void testDefaults() {
+        NoiseWakePlugin.Config c = new NoiseWakePlugin.Config(Collections.<String, Object>emptyMap());
+        assert c.enabled : "on unless turned off";
+        assert !c.keepAwake : "Stay awake is opt-in, so the microphone is closed while the display is on";
+        assert !c.wakeScreenOff && !c.measure;
+    }
+
+    static void testEnabled() throws Exception {
+        Host host = new Host();
+        host.screensaver = true;
+        NoiseWakePlugin plugin = new NoiseWakePlugin(new Microphone.Factory() {
+            public Microphone create() { return new Mic(); }
+        });
+        int opened = Mic.opened.get();
+        plugin.start(host, settings());
+        assert Boolean.TRUE.equals(host.lastSwitch()) : "start publishes the switch with the state in use";
+        waitFor("microphone", () -> Mic.opened.get() == opened + 1);
+
+        // Home Assistant turns it off: saved, the microphone closes and the off state is confirmed.
+        int closed = Mic.closed.get();
+        plugin.onEvent("switch.enabled", payload("on", false));
+        assert Mic.closed.get() == closed + 1 : "the microphone closes";
+        assert host.updates.equals(Collections.singletonList(payload("enabled", false))) : host.updates;
+        assert Boolean.FALSE.equals(host.lastSwitch());
+        assert host.lastStatus().startsWith("Off.") : host.lastStatus();
+        // Nothing opens it while off, measuring included.
+        plugin.configure(settings("enabled", false, "measure", true));
+        plugin.onEvent("ks.screensaver.state", payload("active", true));
+        Thread.sleep(100);
+        assert Mic.opened.get() == opened + 1;
+
+        // And back on.
+        plugin.onEvent("switch.enabled", payload("on", true));
+        waitFor("reopened microphone", () -> Mic.opened.get() == opened + 2);
+        assert Boolean.TRUE.equals(host.lastSwitch());
+        Map<String, Object> saved = host.updates.get(host.updates.size() - 1);
+        assert saved.equals(payload("enabled", true)) : "only Enabled is saved, " + saved;
+
+        // Turning the setting off on the kiosk updates the switch too.
+        int published = host.switchStates.size();
+        plugin.configure(settings("enabled", false));
+        assert host.switchStates.size() == published + 1 && Boolean.FALSE.equals(host.lastSwitch());
+        plugin.configure(settings("enabled", false, "threshold", -20.0));
+        assert host.switchStates.size() == published + 1 : "unchanged Enabled is not republished";
+
+        // Releases without updateSettings save the whole settings map instead.
+        host.oldRelease = true;
+        plugin.onEvent("switch.enabled", payload("on", true));
+        Map<String, Object> full = host.saves.get(host.saves.size() - 1);
+        assert Boolean.TRUE.equals(full.get("enabled")) && Double.valueOf(-20.0).equals(full.get("threshold")) : full;
+        assert Boolean.TRUE.equals(host.lastSwitch());
+        waitFor("microphone", () -> Mic.opened.get() == opened + 3);
+
+        // An unexpected exception on the microphone thread is reported instead of taking the app down.
+        Mic.explode = true;
+        waitFor("crash status", () -> host.lastStatus().startsWith("ERROR The microphone stopped unexpectedly: java.lang.IllegalStateException: boom"));
+        Mic.explode = false;
+        // Turning Enabled off and on starts listening again.
+        plugin.onEvent("switch.enabled", payload("on", false));
+        plugin.onEvent("switch.enabled", payload("on", true));
+        waitFor("microphone after crash", () -> Mic.opened.get() == opened + 4);
+
+        plugin.stop();
+    }
+
     public static void main(String[] args) throws Exception {
         boolean assertions = false;
         assert assertions = true;
@@ -247,6 +328,8 @@ public final class NoiseWakeTest {
         testTrigger();
         testKeepAwake();
         testPlugin();
+        testDefaults();
+        testEnabled();
         System.out.println("NoiseWakeTest passed");
     }
 }

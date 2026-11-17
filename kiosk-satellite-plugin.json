@@ -3,7 +3,7 @@
   "apiVersion": 1,
   "id": "noise-wake",
   "name": "Noise Wake",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "minAndroidSdk": 24,
   "minAppVersion": "2026.10.36",
   "entryClass": "ks.noisewake.NoiseWakePlugin",
@@ -11,11 +11,20 @@
   "author": "Daniël de Jonge",
   "license": "Apache-2.0",
   "capabilities": [
+    "entities",
     "host.read",
     "host.control"
   ],
   "icon": "icon.png",
   "settings": [
+    {
+      "key": "enabled",
+      "type": "boolean",
+      "title": "Enabled",
+      "default": true,
+      "group": "General",
+      "description": "Turn Noise Wake off without disabling the plugin. While it is off, the microphone stays closed."
+    },
     {
       "key": "threshold",
       "type": "number",
@@ -64,9 +73,9 @@
       "key": "keepAwake",
       "type": "boolean",
       "title": "Stay awake while there is sound",
-      "default": true,
+      "default": false,
       "group": "Trigger",
-      "description": "While sound stays above the threshold, keep the screensaver from starting. When it gets quiet, the normal screensaver countdown starts again. The microphone is then open whenever the display is on."
+      "description": "While sound stays above the threshold, keep the screensaver from starting. When it gets quiet, the normal screensaver countdown starts again. With this on, the microphone is open whenever the display is on, not only while the screensaver shows."
     },
     {
       "key": "audioSource",

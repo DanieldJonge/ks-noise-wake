@@ -2,14 +2,16 @@
 package ks.noisewake;
 
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Map;
 import me.jxl.kiosk.plugins.KioskPlugin;
 import me.jxl.kiosk.plugins.PluginHost;
 
 /**
- * Closes the screensaver when the microphone hears sound above a threshold. The microphone is open only while the
- * screensaver shows, while the display is off with "Also wake a display that is off", or while "Measure the room" is
- * on. Audio never leaves the device: each 50 ms chunk becomes one loudness number and is then discarded.
+ * Closes the screensaver when the microphone hears sound above a threshold. While Enabled is on, the microphone is open
+ * only while the screensaver shows, while the display is on with "Stay awake while there is sound", while the display
+ * is off with "Also wake a display that is off", or while "Measure the room" is on. Enabled is also published as an
+ * ESPHome switch. Audio never leaves the device: each 50 ms chunk becomes one loudness number and is then discarded.
  */
 public final class NoiseWakePlugin implements KioskPlugin {
     static final int CHUNK_SAMPLES = Microphone.SAMPLE_RATE / 20;
@@ -19,6 +21,9 @@ public final class NoiseWakePlugin implements KioskPlugin {
 
     /** One complete, immutable set of settings, swapped atomically by configure. */
     static final class Config {
+        /** The settings this config was read from, kept so one value can be changed and saved. */
+        final Map<String, Object> values;
+        final boolean enabled;
         final double threshold;
         final long minDurationMs;
         final long cooldownMs;
@@ -28,11 +33,13 @@ public final class NoiseWakePlugin implements KioskPlugin {
         final String source;
 
         Config(Map<String, Object> s) {
+            values = Collections.unmodifiableMap(new HashMap<String, Object>(s));
+            enabled = !Boolean.FALSE.equals(s.get("enabled"));
             threshold = number(s, "threshold", -35);
             minDurationMs = (long) number(s, "minDuration", 100);
             cooldownMs = (long) (number(s, "cooldown", 10) * 1000);
             wakeScreenOff = Boolean.TRUE.equals(s.get("wakeScreenOff"));
-            keepAwake = !Boolean.FALSE.equals(s.get("keepAwake"));
+            keepAwake = Boolean.TRUE.equals(s.get("keepAwake"));
             measure = Boolean.TRUE.equals(s.get("measure"));
             Object source = s.get("audioSource");
             this.source = source instanceof String ? (String) source : "Microphone";
@@ -73,6 +80,7 @@ public final class NoiseWakePlugin implements KioskPlugin {
     public void start(PluginHost host, Map<String, Object> settings) {
         this.host = host;
         apply(new Config(settings));
+        publishEnabled();
         try {
             host.subscribe("screensaver.state");
             host.subscribe("screen.state");
@@ -104,8 +112,47 @@ public final class NoiseWakePlugin implements KioskPlugin {
 
     @Override
     public void configure(Map<String, Object> settings) {
+        boolean wasEnabled = config.enabled;
         apply(new Config(settings));
         update();
+        if (config.enabled != wasEnabled) publishEnabled();
+    }
+
+    /** Applies a request from the Enabled switch: save it, act on it, then confirm the state actually in use. */
+    private void setEnabled(boolean on) {
+        PluginHost h = host;
+        if (h == null) return;
+        Map<String, Object> next = new HashMap<String, Object>(config.values);
+        next.put("enabled", on);
+        try {
+            try {
+                h.updateSettings(Collections.<String, Object>singletonMap("enabled", on));
+            } catch (UnsupportedOperationException e) {
+                // Releases without updateSettings still have saveSettings, which needs every setting.
+                h.saveSettings(next);
+            }
+        } catch (RuntimeException e) {
+            status("Could not save Enabled: " + e.getMessage(), true);
+            publishEnabled();
+            return;
+        }
+        // Saving settings does not call configure, so apply the change here.
+        apply(new Config(next));
+        update();
+        publishEnabled();
+    }
+
+    /** Publishes the Enabled switch with the state in use. Older releases without entities just skip it. */
+    private void publishEnabled() {
+        PluginHost h = host;
+        if (h == null) return;
+        try {
+            h.publishSwitch("enabled", "Enabled", config.enabled);
+        } catch (UnsupportedOperationException ignored) {
+            // No switches on this release. The Enabled setting still works on the kiosk.
+        } catch (RuntimeException e) {
+            status("Could not publish the Enabled switch: " + e.getMessage(), true);
+        }
     }
 
     private void apply(Config next) {
@@ -130,6 +177,9 @@ public final class NoiseWakePlugin implements KioskPlugin {
             screenEventSeen = true;
             screenOn = !Boolean.FALSE.equals(payload.get("on"));
             update();
+        } else if ("switch.enabled".equals(event)) {
+            Object on = payload.get("on");
+            if (on instanceof Boolean) setEnabled((Boolean) on);
         }
     }
 
@@ -152,7 +202,7 @@ public final class NoiseWakePlugin implements KioskPlugin {
     /** Open or close the microphone to match the current state. Runs on the plugin worker. */
     private void update() {
         Config c = config;
-        boolean listen = host != null && (c.measure || wakeWanted(c) || keepAwakeWanted(c));
+        boolean listen = host != null && c.enabled && (c.measure || wakeWanted(c) || keepAwakeWanted(c));
         if (listen && listener == null) {
             listener = new Listener(c.source);
             listener.start();
@@ -169,6 +219,7 @@ public final class NoiseWakePlugin implements KioskPlugin {
     }
 
     private String idleMessage(Config c) {
+        if (!c.enabled) return "Off. The microphone stays closed until Enabled is turned on.";
         String waiting = c.keepAwake && !screenOn ? "Waiting for the display to turn on."
                 : c.wakeScreenOff ? "Waiting for the screensaver or for the display to turn off." : "Waiting for the screensaver.";
         return lastWake.isEmpty() ? waiting : waiting + " " + lastWake;
@@ -250,6 +301,15 @@ public final class NoiseWakePlugin implements KioskPlugin {
 
         @Override
         public void run() {
+            // This thread runs inside the Kiosk Satellite process, so anything escaping it would take the app down.
+            try {
+                record();
+            } catch (Throwable t) {
+                if (!stopping) status("The microphone stopped unexpectedly: " + t + ". Turn Enabled off and on to try again.", true);
+            }
+        }
+
+        private void record() {
             Microphone mic = microphones.create();
             String error = mic.open(source);
             if (error != null) {
@@ -277,7 +337,7 @@ public final class NoiseWakePlugin implements KioskPlugin {
                 int count = mic.read(buffer);
                 if (stopping) return;
                 if (count < 0) {
-                    status("Recording stopped with Android error " + count + ". Turn the plugin off and on to try again.", true);
+                    status("Recording stopped with Android error " + count + ". Turn Enabled off and on to try again.", true);
                     return;
                 }
                 if (count == 0) continue;
